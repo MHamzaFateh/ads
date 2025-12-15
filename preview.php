@@ -200,8 +200,14 @@ require_once 'config.php';
         function onPlayerStateChange(event) {
             if (event.data === YT.PlayerState.ENDED) {
                 isAdPlaying = false;
-                // Process any pending detection after a small delay
-                setTimeout(processPendingDetection, 1000);
+                // Check for stable detection after ad ends
+                setTimeout(() => {
+                    if (currentStableDetection && currentStableDetection.gender !== 'default') {
+                        updateAd(currentStableDetection.gender, currentStableDetection.ageGroup);
+                    } else {
+                        checkForStableDetection();
+                    }
+                }, 1000);
             }
         }
 
@@ -234,16 +240,18 @@ require_once 'config.php';
         });
 
         // Face detection and ad state variables
-        let lastDetection = {
-            gender: null,
-            ageGroup: null,
-            timestamp: 0,
-            confidence: 0
-        };
         let currentAd = null;
         let isAdPlaying = false;
-        let pendingDetection = null;
         let modelsLoaded = false;
+        
+        // Stabilized detection system variables
+        let detectionHistory = []; // Array to store recent detections
+        let currentStableDetection = null; // The stabilized detection we're using
+        let minAdPlayDuration = 10000; // Minimum 10 seconds before switching (adjust as needed)
+        let lastAdSwitchTime = 0; // Track when we last switched ads
+        let detectionVoteThreshold = 5; // Require 5 consistent detections before switching
+        let noFaceTimeout = null; // Handle "no face" with delay
+        let detectionInterval = 500; // Detection interval in milliseconds (slower = less flickering)
         
         // Check if YouTube API is loaded before starting face detection
         async function checkYouTubeAPILoaded() {
@@ -357,7 +365,7 @@ require_once 'config.php';
             }
         }
 
-        // Process face detection results
+        // Process face detection results with stabilized voting system
         async function detectFaces() {
             if (!modelsLoaded) {
                 console.warn('Models not loaded yet, retrying...');
@@ -368,14 +376,14 @@ require_once 'config.php';
             // Check if video is ready
             if (videoElement.readyState < 2) { // 2 = HAVE_CURRENT_DATA
                 console.warn('Video not ready, retrying...');
-                setTimeout(detectFaces, 500);
+                setTimeout(detectFaces, detectionInterval);
                 return;
             }
 
             try {
                 const options = new faceapi.TinyFaceDetectorOptions({
                     inputSize: 320,  // Match our video size
-                    scoreThreshold: 0.3  // Lower threshold to detect more faces
+                    scoreThreshold: 0.5  // Increased from 0.3 for better accuracy
                 });
 
                 // Perform face detection
@@ -399,29 +407,41 @@ require_once 'config.php';
                     const age = detection.age;
                     let ageGroup = 'adult'; // Default age group
                     
-                    // Categorize age group
-                    if (age < 18) ageGroup = 'young';
-                    else if (age < 30) ageGroup = 'young';
-                    else if (age < 50) ageGroup = 'adult';
-                    else ageGroup = 'senior';
+                    // Fixed age group categorization
+                    if (age < 13) ageGroup = 'child';
+                    else if (age < 20) ageGroup = 'teenage';
+                    else if (age < 36) ageGroup = 'young';
+                    else ageGroup = 'adult';
                     
                     const confidence = detection.detection.score;
-                    const now = Date.now();
+                    
+                    // Clear any pending "no face" timeout
+                    if (noFaceTimeout) {
+                        clearTimeout(noFaceTimeout);
+                        noFaceTimeout = null;
+                    }
                     
                     // Update detection info
                     detectionInfo.textContent = `Detected: ${gender}, ${Math.round(age)} years (${ageGroup}) [${Math.round(confidence * 100)}%]`;
                     
-                    // Update ad if needed
-                    if (shouldSwitchAd(gender, ageGroup, confidence, now)) {
-                        console.log(`Updating ad for ${gender}, ${ageGroup}`);
-                        updateAd(gender, ageGroup);
+                    // Only process high-confidence detections
+                    if (confidence >= 0.6) {
+                        addDetectionToHistory(gender, ageGroup, confidence);
+                        checkForStableDetection();
+                    } else {
+                        detectionInfo.textContent += ' (low confidence)';
                     }
                 } else {
                     detectionInfo.textContent = 'No face detected';
-                    console.log('No face detected, switching to default ad');
-                    // Always switch to default ad when no face is detected
-                    lastDetection = { gender: 'default', ageGroup: 'default', confidence: 1, timestamp: Date.now() };
-                    updateAd('default', 'default');
+                    
+                    // Don't immediately switch - wait 3 seconds of no face detection
+                    if (!noFaceTimeout) {
+                        noFaceTimeout = setTimeout(() => {
+                            console.log('No face detected for 3 seconds, switching to default');
+                            clearDetectionHistory();
+                            switchToDefaultAd();
+                        }, 3000);
+                    }
                 }
             } catch (error) {
                 console.error('Error during face detection:', error);
@@ -432,76 +452,109 @@ require_once 'config.php';
                 return;
             }
             
-            // Continue detection with requestAnimationFrame for smooth updates
-            requestAnimationFrame(detectFaces);
+            // Continue detection at slower interval (500ms) instead of every frame
+            setTimeout(detectFaces, detectionInterval);
         }
 
-        function shouldSwitchAd(newGender, newAgeGroup, confidence, timestamp) {
-            // Always switch if no ad is playing
-            if (!isAdPlaying) {
-                console.log(`No ad playing, switching to new ad (${newGender}, ${newAgeGroup}, ${Math.round(confidence * 100)}%)`);
-                lastDetection = { gender: newGender, ageGroup: newAgeGroup, confidence, timestamp };
-                return true;
+        // Add detection to history for voting system
+        function addDetectionToHistory(gender, ageGroup, confidence) {
+            const now = Date.now();
+            const detection = { gender, ageGroup, confidence, timestamp: now };
+            
+            // Add to history
+            detectionHistory.push(detection);
+            
+            // Keep only last 10 detections (last ~5 seconds at 500ms intervals)
+            if (detectionHistory.length > 10) {
+                detectionHistory.shift();
             }
             
-            // If we're currently showing the default ad, only switch if we have high confidence in the new detection
-            if (lastDetection.gender === 'default') {
-                if (confidence >= 0.7) {
-                    console.log(`Switching from default to detected (${newGender}, ${newAgeGroup}, ${Math.round(confidence * 100)}%)`);
-                    lastDetection = { gender: newGender, ageGroup: newAgeGroup, confidence, timestamp };
-                    return true;
-                } else {
-                    console.log(`Keeping default ad - new detection confidence too low (${Math.round(confidence * 100)}% < 70%)`);
-                    return false;
+            // Remove old detections (older than 3 seconds)
+            const threeSecondsAgo = now - 3000;
+            detectionHistory = detectionHistory.filter(d => d.timestamp > threeSecondsAgo);
+        }
+
+        // Check for stable detection using voting system
+        function checkForStableDetection() {
+            if (detectionHistory.length < detectionVoteThreshold) {
+                return; // Not enough detections yet
+            }
+            
+            // Count votes for each demographic combination
+            const votes = {};
+            detectionHistory.forEach(d => {
+                const key = `${d.gender}_${d.ageGroup}`;
+                if (!votes[key]) {
+                    votes[key] = { count: 0, avgConfidence: 0, gender: d.gender, ageGroup: d.ageGroup };
+                }
+                votes[key].count++;
+                votes[key].avgConfidence = (votes[key].avgConfidence * (votes[key].count - 1) + d.confidence) / votes[key].count;
+            });
+            
+            // Find the most voted detection
+            let maxVotes = 0;
+            let winningDetection = null;
+            
+            for (const key in votes) {
+                if (votes[key].count > maxVotes) {
+                    maxVotes = votes[key].count;
+                    winningDetection = votes[key];
                 }
             }
             
-            // Don't switch too often (minimum 5 seconds between switches)
-            const timeSinceLastSwitch = timestamp - lastDetection.timestamp;
-            if (timeSinceLastSwitch < 5000) {
-                return false;
-            }
-            
-            // If we already have a pending detection, update it if this one is better
-            if (pendingDetection) {
-                if (confidence > pendingDetection.confidence) {
-                    console.log('Updating pending detection with better confidence');
-                    pendingDetection = { gender: newGender, ageGroup: newAgeGroup, confidence, timestamp };
-                }
-                return false;
-            }
-            
-            // If this detection is significantly better than the current one (20% more confident)
-            const confidenceThreshold = lastDetection.confidence * 1.2;
-            if (confidence > confidenceThreshold) {
-                console.log(`Better detection found (${Math.round(confidence * 100)}% > ${Math.round(confidenceThreshold * 100)}%)`);
-                pendingDetection = { gender: newGender, ageGroup: newAgeGroup, confidence, timestamp };
+            // Require at least detectionVoteThreshold votes (e.g., 5 out of 10)
+            if (maxVotes >= detectionVoteThreshold && winningDetection) {
+                const newDetection = {
+                    gender: winningDetection.gender,
+                    ageGroup: winningDetection.ageGroup,
+                    confidence: winningDetection.avgConfidence,
+                    timestamp: Date.now()
+                };
                 
-                // Schedule the switch after a short delay
-                setTimeout(() => {
-                    if (pendingDetection) {
-                        console.log('Processing pending detection after delay');
-                        const { gender, ageGroup } = pendingDetection;
-                        pendingDetection = null;
-                        updateAd(gender, ageGroup);
+                // Check if this is different from current stable detection
+                if (!currentStableDetection || 
+                    currentStableDetection.gender !== newDetection.gender ||
+                    currentStableDetection.ageGroup !== newDetection.ageGroup) {
+                    
+                    // Check minimum ad play duration
+                    const timeSinceLastSwitch = Date.now() - lastAdSwitchTime;
+                    if (timeSinceLastSwitch >= minAdPlayDuration || !isAdPlaying) {
+                        console.log(`Stable detection: ${newDetection.gender}, ${newDetection.ageGroup} (${maxVotes} votes, ${Math.round(newDetection.confidence * 100)}% confidence)`);
+                        currentStableDetection = newDetection;
+                        lastAdSwitchTime = Date.now();
+                        updateAd(newDetection.gender, newDetection.ageGroup);
+                    } else {
+                        console.log(`Waiting for minimum ad duration (${Math.round((minAdPlayDuration - timeSinceLastSwitch) / 1000)}s remaining)`);
                     }
-                }, 1000);
+                }
             }
-            
-            return false;
         }
 
-        function processPendingDetection() {
-            if (pendingDetection && !isAdPlaying) {
-                const { gender, ageGroup } = pendingDetection;
-                pendingDetection = null;
-                updateAd(gender, ageGroup);
+        // Clear detection history
+        function clearDetectionHistory() {
+            detectionHistory = [];
+            currentStableDetection = null;
+        }
+
+        // Switch to default ad
+        function switchToDefaultAd() {
+            currentStableDetection = { gender: 'default', ageGroup: 'default', confidence: 1, timestamp: Date.now() };
+            const timeSinceLastSwitch = Date.now() - lastAdSwitchTime;
+            if (timeSinceLastSwitch >= minAdPlayDuration || !isAdPlaying) {
+                lastAdSwitchTime = Date.now();
+                playDefaultAd();
             }
         }
 
         function updateAd(gender, ageGroup) {
-            // Don't update if we're already showing this ad
+            // Don't update if we're already showing this exact ad
             if (isAdPlaying && currentAd && currentAd.gender === gender && currentAd.ageGroup === ageGroup) {
+                return;
+            }
+            
+            // Handle default ad case
+            if (gender === 'default' || ageGroup === 'default') {
+                playDefaultAd();
                 return;
             }
             
@@ -517,6 +570,11 @@ require_once 'config.php';
             else if (ads[gender] && ads[gender].all && ads[gender].all.length > 0) {
                 const adsForGender = ads[gender].all;
                 adUrl = adsForGender[Math.floor(Math.random() * adsForGender.length)];
+            }
+            // Try 'all' gender with specific age group
+            else if (ads.all && ads.all[ageGroup] && ads.all[ageGroup].length > 0) {
+                const adsForAgeGroup = ads.all[ageGroup];
+                adUrl = adsForAgeGroup[Math.floor(Math.random() * adsForAgeGroup.length)];
             }
             // Fall back to default ad
             else {

@@ -23,8 +23,16 @@ function initDB() {
             video_link TEXT NOT NULL,
             gender TEXT NOT NULL,
             age_groups TEXT NOT NULL,
+            is_default INTEGER DEFAULT 0,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )');
+        
+        // Add is_default column if it doesn't exist (for existing databases)
+        try {
+            $db->exec('ALTER TABLE ads ADD COLUMN is_default INTEGER DEFAULT 0');
+        } catch (PDOException $e) {
+            // Column already exists, ignore error
+        }
         
         // Create default admin user if not exists
         $stmt = $db->prepare('SELECT COUNT(*) as count FROM users WHERE username = :username');
